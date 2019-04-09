@@ -364,3 +364,376 @@ flow_add_packet(flow_t *f, packet_t *packet, register BOOL src){
 	return 0;
 }
 
+
+/* Extract http_pair_t objects from flow's packet_t chain */
+int 
+flow_extract_http(flow_t *f){
+	/* check if the flow is carrying HTTP again */
+	if( f->http == FALSE)
+		return 1;
+		
+	/*
+	 * Find the actual FIN sequences.
+	 */
+	seq_t	*seq = f->order->src;
+	seq_t	*src_fin_seq = NULL;
+	seq_t	*dst_fin_seq = NULL;
+	int found = 0;
+	
+	while(seq != NULL){
+		/* Update flow's first byte time.
+		 * FBT of flow refers to the payload's FBT.
+		 */
+		if(seq->pkt != NULL && found == 0){
+			found = 1;
+			f->fb_sec = seq->cap_sec;
+			f->fb_usec = seq->cap_usec;
+		}
+		
+		/*Search the FIN sequence in sequence queue.*/
+		if(seq->th_flags & TH_FIN == TH_FIN){
+			src_fin_seq = seq;
+			break;
+		}
+		seq = seq->next;
+	}
+	
+	seq = f->order->dst;
+	while(seq != NULL){
+		/*Search the FIN sequence in sequence queue.*/
+		if(seq->th_flags & TH_FIN == TH_FIN){
+			dst_fin_seq = seq;
+			break;
+		}
+		seq = seq->next;
+	}
+	
+	/*
+	 * Set the client and server FIN sequences.
+	 */
+	seq_t	*fin_seq = NULL;	/* The actual FIN sequence. */
+	u_int8_t	fin_dir = 0;	/* fin_dir:
+	 * 0: Not set;
+	 * 1: src_fin_seq is used;
+	 * 2: dst_fin_seq is used;
+	 */
+	
+	if (src_fin_seq != NULL && dst_fin_seq == NULL){
+		fin_seq = src_fin_seq;
+		fin_dir = 1;
+	}else if (src_fin_seq == NULL && dst_fin_seq != NULL){
+		fin_seq = dst_fin_seq;
+		fin_dir = 2;
+	}else if (src_fin_seq != NULL && dst_fin_seq != NULL){
+		fin_seq = src_fin_seq;
+		fin_dir = 1;
+		if(compare_sequence_time(src_fin_seq, dst_fin_seq) == 1){
+			fin_seq = dst_fin_seq;
+			fin_dir = 2;
+		}
+	}else{
+		fin_seq = NULL;
+		fin_dir = 0;
+	}
+	
+	/* 
+	 * First step: find requests 
+	 */
+	packet_t *pkt;
+	request_t	*req;
+	response_t	*rsp;
+	int reqn = 0;	// Number of requests.
+	int rspn = 0;	// Number of responses.
+	
+	http_pair_t *new_http = NULL;
+	seq_t *seq_next = NULL;	/* for temp */
+	seq_t *first_seq = NULL;
+	/* Set seq and seq_next */
+	seq = f->order->src;
+	if( seq != NULL){
+		seq_next = seq->next;
+	}else{
+		seq_next = NULL;		/* NULL */
+	}
+	
+	if (fin_seq != NULL && seq != NULL){
+		/*A FIN packet exists.*/
+		while(compare_sequence_time(seq, fin_seq) < 0){
+			pkt = seq->pkt;
+			if(pkt != NULL && pkt->http == HTTP_REQ){
+				/* When a new HTTP request is found,
+				 * create a HTTP pair object, then add the object to
+				 * flow's HTTP chain.
+				 */
+				reqn++;
+				/* new HTTP pair object*/
+				new_http = http_new();
+				first_seq = seq;
+				new_http->req_fb_sec = seq->cap_sec;
+				new_http->req_fb_usec = seq->cap_usec;
+				new_http->req_lb_sec = seq->cap_sec;
+				new_http->req_lb_usec = seq->cap_usec;
+					
+				/* Add the object to flow's HTTP chain */
+				flow_add_http(f, new_http);
+				/* new request object */
+				req = http_request_new();
+				/* Add the request object to the foregoing HTTP pair object */
+				http_add_request(new_http, req);
+				/* parse and write values to foregoing request object */
+				http_parse_request(req, pkt->tcp_odata, pkt->tcp_odata + pkt->tcp_dl);
+			}else{
+				/*Omit the TCP handshake sequences.*/
+				if(new_http == NULL){
+					seq = seq->next;
+					if(seq != NULL)
+						seq_next = seq->next;
+					else
+						break;
+					continue;
+				}
+			}
+
+			if( new_http != NULL ){
+				if( seq_next == NULL || seq_next == fin_seq || seq_next->pkt != NULL ||\
+						compare_sequence_time(seq_next, fin_seq) >= 0 ){
+					//assert(seq->nxt_seq != 0);
+					if( seq->nxt_seq != 0){
+						new_http->req_total_len = seq->nxt_seq - first_seq->seq;
+						new_http->req_body_len = 0;
+					}
+					/*Update flow's last byte time.*/
+					if ((seq->cap_sec > f->lb_sec) || (seq->cap_sec == f->lb_sec && seq->cap_usec > f->lb_usec)){
+						f->lb_sec = seq->cap_sec;
+						f->lb_usec = seq->cap_usec;
+					}
+				}else{
+					//assert(seq->seq <= seq_next->seq);
+				}
+			}
+			
+			/* Continue to next sequence.*/
+			seq = seq->next;
+			if(seq != NULL)
+				seq_next = seq->next;
+			else
+				break;
+		}
+	}else{
+		/* No FIN packet found.*/
+		while(seq != NULL){
+			pkt = seq->pkt;
+			if(pkt != NULL && pkt->http == HTTP_REQ){
+				/* When a new HTTP request is found,
+				 * create a HTTP pair object, then add the object to
+				 * flow's HTTP chain.
+				 */
+				reqn++;
+				/* new HTTP pair object*/
+				new_http = http_new();
+				first_seq = seq;
+				new_http->req_fb_sec = seq->cap_sec;
+				new_http->req_fb_usec = seq->cap_usec;
+				new_http->req_lb_sec = seq->cap_sec;
+				new_http->req_lb_usec = seq->cap_usec;
+				
+				/* Add the object to flow's HTTP chain */
+				flow_add_http(f, new_http);
+				/* new request object */
+				req = http_request_new();
+				/* Add the request object to the foregoing HTTP pair object */
+				http_add_request(new_http, req);
+				/* parse and write values to foregoing request object */
+				http_parse_request(req, pkt->tcp_odata, pkt->tcp_odata + pkt->tcp_dl);
+			}else{
+				if(new_http == NULL){
+					/*Omit the TCP handshake sequences.*/
+					seq = seq->next;
+					if(seq != NULL)
+						seq_next = seq->next;
+					else
+						break;
+					continue;
+				}
+			}
+			if( new_http != NULL ){
+				if( seq_next == NULL || seq_next->pkt != NULL ){
+					//assert(seq->nxt_seq != 0);
+					if( seq->nxt_seq != 0){
+						new_http->req_total_len = seq->nxt_seq - first_seq->seq;
+						new_http->req_body_len = 0;
+					}
+					/*Update flow's last byte time.*/
+					if ((seq->cap_sec > f->lb_sec) || (seq->cap_sec == f->lb_sec && seq->cap_usec > f->lb_usec)){
+						f->lb_sec = seq->cap_sec;
+						f->lb_usec = seq->cap_usec;
+					}
+				}else{
+					//assert(seq->seq <= seq_next->seq);
+				}
+			}
+			/*Continue to next sequence.*/
+			seq = seq->next;
+			if(seq != NULL)
+				seq_next = seq->next;
+			else
+				break;
+		}
+	}
+
+	/* If no responses found, we treat the flow as invalid and stop parsing */
+	if(reqn == 0)
+		return 1;
+		
+	/* Second step: find responses */
+	http_pair_t *tmp = f->http_f;
+	http_pair_t *found_http = NULL;
+	seq = f->order->dst;
+	if( seq != NULL)
+		seq_next = seq->next;
+	else
+		seq_next = NULL;		/* NULL */
+	if(fin_seq != NULL && seq != NULL){
+		/*There is FIN packet.*/
+		while(compare_sequence_time(seq, fin_seq) < 0){
+			pkt = seq->pkt;
+			if ( pkt != NULL && pkt->http == HTTP_RSP){
+				/*
+				 * Similar to the request parsing, a new response is
+				 * added to the first pair without response
+				 */
+				rspn++;
+				/* Try to find the first pair without response */
+				while(tmp != NULL){
+					if(tmp->response_header == NULL)
+						break;
+					tmp = tmp->next;
+				}
+				if(tmp == NULL)
+					/* no response empty, then return */
+					return 1;
+				else{
+					/*Found!*/
+					found_http = tmp;
+					first_seq = seq;
+					found_http->rsp_fb_sec = seq->cap_sec;
+					found_http->rsp_fb_usec = seq->cap_usec;
+					rsp = http_response_new();
+					http_add_response(found_http, rsp);
+					http_parse_response(rsp, pkt->tcp_odata, pkt->tcp_odata + pkt->tcp_dl);
+				}
+			}else{
+				if(found_http == NULL){
+					seq = seq->next;
+					if(seq != NULL)
+						seq_next = seq->next;
+					else
+						break;
+					continue;
+				}
+			}
+
+			if ( found_http != NULL ){
+				/*first_seq != NULL*/
+				if( seq_next == NULL || seq_next == fin_seq || seq_next->pkt != NULL ||\
+						compare_sequence_time(seq_next, fin_seq) >= 0 ){
+					found_http->rsp_lb_sec = seq->cap_sec;
+					found_http->rsp_lb_usec = seq->cap_usec;
+					//assert( seq->nxt_seq != 0 );
+					if(seq->nxt_seq != 0){
+						found_http->rsp_total_len = seq->nxt_seq - first_seq->seq;
+						found_http->rsp_body_len = found_http->rsp_total_len - found_http->response_header->hdlen;
+						if (found_http->rsp_body_len < 0)
+						{
+						    found_http->rsp_body_len = -1;
+						}
+					}
+					/*Update flow's last byte time.*/
+					if ((seq->cap_sec > f->lb_sec) || (seq->cap_sec == f->lb_sec && seq->cap_usec > f->lb_usec)){
+						f->lb_sec = seq->cap_sec;
+						f->lb_usec = seq->cap_usec;
+					}
+				}else{
+					//assert(seq->seq <= seq_next->seq);
+				}
+			}
+
+			seq = seq->next;
+			if(seq != NULL)
+				seq_next = seq->next;
+			else
+				break;
+		}
+	}else{
+		/*There is no FIN packet.*/
+		while(seq != NULL){
+			pkt = seq->pkt;
+			if ( pkt != NULL && pkt->http == HTTP_RSP ){
+				/*
+				 * Similar to the request parsing, a new response is
+				 * added to the first pair without response
+				 */
+				rspn++;
+				/* Try to find the first pair without response */
+				while(tmp != NULL){
+					if(tmp->response_header == NULL)
+						break;
+					tmp = tmp->next;
+				}
+				if(tmp == NULL)
+					/* no response empty, then return */
+					return 1;
+				else{
+					/*Found!*/
+					found_http = tmp;
+					first_seq = seq;
+					found_http->rsp_fb_sec = seq->cap_sec;
+					found_http->rsp_fb_usec = seq->cap_usec;
+					rsp = http_response_new();
+					http_add_response(found_http, rsp);
+					http_parse_response(rsp, pkt->tcp_odata, pkt->tcp_odata + pkt->tcp_dl);
+				}
+			}else{
+				if(found_http == NULL){
+					seq = seq->next;
+					if(seq != NULL)
+						seq_next = seq->next;
+					else
+						break;
+					continue;
+				}
+			}
+
+			if ( found_http != NULL ){
+				/*first_seq != NULL*/
+				if( seq_next == NULL || seq_next->pkt != NULL ){
+					found_http->rsp_lb_sec = seq->cap_sec;
+					found_http->rsp_lb_usec = seq->cap_usec;
+					//assert( seq->nxt_seq != 0 );
+					if(seq->nxt_seq != 0){
+						found_http->rsp_total_len = seq->nxt_seq - first_seq->seq;	
+						found_http->rsp_body_len = found_http->rsp_total_len - found_http->response_header->hdlen;
+						if (found_http->rsp_body_len < 0)
+                        {
+                            found_http->rsp_body_len = -1;
+                        }
+					}
+					/*Update flow's last byte time.*/
+					if ((seq->cap_sec > f->lb_sec) || (seq->cap_sec == f->lb_sec && seq->cap_usec > f->lb_usec)){
+						f->lb_sec = seq->cap_sec;
+						f->lb_usec = seq->cap_usec;
+					}
+				}else{
+					//assert(seq->seq <= seq_next->seq);
+				}
+			}
+
+			seq = seq->next;
+			if(seq != NULL)
+				seq_next = seq->next;
+			else
+				break;
+		}
+	}
+	return 0;
+}
