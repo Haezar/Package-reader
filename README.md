@@ -7,7 +7,7 @@ Theme: Interception and logging of network traffic
 
 The application will intercept and analyze all network traffic passing through the PC.  
 Development tools:
-* Pythno 3.6
+* C
 * VSCode
 
 Operating systems: Unix(Linux), Windows(optional)  
@@ -25,7 +25,7 @@ Functions:
 Александров Антон, 653502  
 Тема: Перехват и протоколирование сетефого трафика  
 Инструменты разработки:
-* Python 3.6
+* C
 * VSCode
 
 Операционные системы: Unix(Linux), Windows(optional)  
