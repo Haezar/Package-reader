@@ -1,0 +1,6 @@
+To install this application you need to download libpcap scons and  json-c
+Then use command below for build project
+>> scons
+To start program use:
+>> ./bin/http-sniffer
+Application works on both operating systems Windows and Linux
